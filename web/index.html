@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>openlist-mount</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>openlist-mount</h1>
+  <div id="rclone-status" class="rclone-badge">检查 rclone 中…</div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>新增挂载</h2>
+    <form id="add-form" class="grid">
+      <label>名称
+        <input name="name" required placeholder="我的网盘">
+      </label>
+      <label>openlist WebDAV URL
+        <input name="url" required placeholder="http://192.168.1.2:5244/dav">
+      </label>
+      <label>用户名
+        <input name="username" placeholder="admin">
+      </label>
+      <label>密码
+        <input name="password" type="password" placeholder="留空则匿名">
+      </label>
+      <label>挂载点
+        <input name="mountpoint" required placeholder="/mnt/openlist">
+      </label>
+      <label>目录缓存
+        <input name="dir_cache" placeholder="24h">
+      </label>
+      <label>属性缓存
+        <input name="attr_time" placeholder="1h">
+      </label>
+      <label class="checkbox">
+        <input name="allow_other" type="checkbox">
+        <span>允许其他用户访问 (--allow-other, 给 Samba 用)</span>
+      </label>
+      <label class="checkbox">
+        <input name="auto_start" type="checkbox">
+        <span>开机自动挂载</span>
+      </label>
+      <button type="submit" class="primary">保存</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <div class="row-between">
+      <h2>挂载列表</h2>
+      <button id="btn-refresh" class="ghost">刷新</button>
+    </div>
+    <div id="list"></div>
+  </section>
+
+  <section class="card">
+    <div class="row-between">
+      <h2>systemd 开机自启</h2>
+      <button id="btn-systemd" class="ghost">生成 unit 文件</button>
+    </div>
+    <p class="hint">生成的服务文件含 <code>Restart=on-failure</code> + <code>CAP_SYS_ADMIN</code> capability,挂载点需要 <code>/etc/fuse.conf</code> 启用 <code>user_allow_other</code>。</p>
+  </section>
+</main>
+
+<!-- 日志模态框 -->
+<div id="modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="row-between">
+      <h3 id="modal-title">日志</h3>
+      <button id="modal-close" class="ghost">关闭</button>
+    </div>
+    <pre id="modal-body"></pre>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
