@@ -10,7 +10,7 @@
 set -euo pipefail
 
 # ---- 配置项 ----
-REPO="${REPO:-}"                            # 例: yourname/openlist-mount;为空时从 BIN_DIR 取本地二进制
+REPO="${REPO:-pelico/openlist-mount}"        # 默认指向本项目仓库;自定义分发时覆盖
 BIN_DIR="${BIN_DIR:-}"                       # 本地二进制目录(无网络/GitHub 时用)
 VERSION="${VERSION:-latest}"                 # latest 或 v0.1.0
 INSTALL_BIN="${INSTALL_BIN:-/usr/local/bin/openlist-mount}"
