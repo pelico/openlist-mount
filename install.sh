@@ -18,6 +18,11 @@ DATA_DIR="${DATA_DIR:-/var/lib/openlist-mount}"
 ADDR="${ADDR:-:7777}"
 RCLONE_BIN="${RCLONE_BIN:-rclone}"
 
+# 下载二进制时按顺序尝试的镜像;第一个通的就用。空格分隔。
+# 第一项 github.com 直连(国外主机友好);后面是国内常用 GitHub 反代,方便国内 armbian 主机。
+GITHUB_MIRRORS_DEFAULT="https://github.com https://gh-proxy.com/https://github.com https://ghfast.top/https://github.com https://ghproxy.net/https://github.com https://mirror.ghproxy.com/https://github.com"
+GITHUB_MIRRORS="${GITHUB_MIRRORS:-$GITHUB_MIRRORS_DEFAULT}"
+
 # 颜色
 if [ -t 1 ]; then
   C_GREEN=$'\e[32m'; C_RED=$'\e[31m'; C_YELLOW=$'\e[33m'; C_BLUE=$'\e[34m'; C_RESET=$'\e[0m'
@@ -121,19 +126,34 @@ fi
 # ---- 6. 下载/拷贝二进制 ----
 TMP_BIN=$(mktemp)
 
+# 下载函数:挨个尝试镜像,第一个成功的就用
+download_binary() {
+  local path="$1"  # 例: /pelico/openlist-mount/releases/latest/download/openlist-mount-armhf
+  local out="$2"
+  for base in $GITHUB_MIRRORS; do
+    local url="$base$path"
+    log "尝试下载: $url"
+    if curl -fL --connect-timeout 8 --max-time 120 -o "$out" "$url"; then
+      ok "下载成功: $url"
+      return 0
+    fi
+    warn "$url 不可用,尝试下一个..."
+  done
+  return 1
+}
+
 if [ -n "$BIN_DIR" ] && [ -f "$BIN_DIR/openlist-mount-$ARCH" ]; then
   log "从本地 $BIN_DIR 复制二进制..."
   cp "$BIN_DIR/openlist-mount-$ARCH" "$TMP_BIN"
 elif [ -n "$REPO" ]; then
-  URL_BASE="https://github.com/$REPO/releases/download"
+  # 拼出 path 部分(不含 scheme/host,直接以 / 开头)
   if [ "$VERSION" = "latest" ]; then
-    URL="$URL_BASE/latest/download/openlist-mount-$ARCH"
+    PATH_PART="/$REPO/releases/latest/download/openlist-mount-$ARCH"
   else
-    URL="$URL_BASE/$VERSION/openlist-mount-$ARCH"
+    PATH_PART="/$REPO/releases/download/$VERSION/openlist-mount-$ARCH"
   fi
-  log "从 $URL 下载二进制..."
-  if ! curl -fL --retry 3 --retry-delay 2 -o "$TMP_BIN" "$URL"; then
-    die "下载失败,请检查 REPO=$REPO 是否正确,或在 release 上传了 openlist-mount-$ARCH"
+  if ! download_binary "$PATH_PART" "$TMP_BIN"; then
+    die "所有镜像下载失败,请检查 REPO=$REPO 是否正确,或手动下载二进制后用 BIN_DIR=./dist ./install.sh"
   fi
 else
   die "无法获取二进制: 请设置 REPO=<owner>/<repo> 或 BIN_DIR=./dist"
