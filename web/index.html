@@ -37,6 +37,14 @@
       <label>属性缓存
         <input name="attr_time" placeholder="1h">
       </label>
+      <label>缓存模式
+        <select name="vfs_cache_mode">
+          <option value="off" selected>off - 不缓存(只读友好,默认)</option>
+          <option value="minimal">minimal - 仅缓存已打开的文件</option>
+          <option value="writes">writes - 写入先落本地再上传(推荐写入场景)</option>
+          <option value="full">full - 全部缓存(最稳,占磁盘)</option>
+        </select>
+      </label>
       <label class="checkbox">
         <input name="allow_other" type="checkbox">
         <span>允许其他用户访问 (--allow-other, 给 Samba 用)</span>

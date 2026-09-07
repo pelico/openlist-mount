@@ -79,7 +79,7 @@ function renderItem(it) {
       挂载点: ${escapeHtml(c.mountpoint)}
       ${s.running ? ` · PID: ${s.pid} · 启动于 ${fmtTime(s.started_at)}` : ''}
       ${s.last_error ? ` · 错误: ${escapeHtml(s.last_error)}` : ''}
-      <br>目录缓存 ${escapeHtml(c.dir_cache || '24h')} · 属性缓存 ${escapeHtml(c.attr_time || '1h')}
+      <br>目录缓存 ${escapeHtml(c.dir_cache || '24h')} · 属性缓存 ${escapeHtml(c.attr_time || '1h')} · 缓存模式 ${escapeHtml(c.vfs_cache_mode || 'off')}
       ${c.allow_other ? ' · 允许其他用户' : ''}
       ${c.auto_start ? ' · 开机自启' : ''}
     </div>
@@ -128,6 +128,7 @@ document.getElementById('add-form').addEventListener('submit', async (e) => {
     mountpoint: form.mountpoint.value.trim(),
     dir_cache: form.dir_cache.value.trim() || '24h',
     attr_time: form.attr_time.value.trim() || '1h',
+    vfs_cache_mode: form.vfs_cache_mode.value || 'off',
     allow_other: form.allow_other.checked,
     auto_start: form.auto_start.checked,
   };

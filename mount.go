@@ -15,16 +15,17 @@ import (
 
 // MountConfig 描述单个 openlist 挂载项。
 type MountConfig struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`       // 友好显示名
-	URL        string `json:"url"`        // openlist WebDAV 根地址,如 http://192.168.1.2:5244/dav
-	Username   string `json:"username"`
-	Password   string `json:"password"`  // 明文,仅在内存与 config.json 中,本地落盘注意权限
-	Mountpoint string `json:"mountpoint"` // /mnt/openlist
-	AllowOther bool   `json:"allow_other"`
-	DirCache   string `json:"dir_cache"`  // 默认 24h
-	AttrTime   string `json:"attr_time"`  // 默认 1h
-	AutoStart  bool   `json:"auto_start"` // 工具启动时是否自动挂载
+	ID          string `json:"id"`
+	Name        string `json:"name"`        // 友好显示名
+	URL         string `json:"url"`        // openlist WebDAV 根地址,如 http://192.168.1.2:5244/dav
+	Username    string `json:"username"`
+	Password    string `json:"password"`   // 明文,仅在内存与 config.json 中,本地落盘注意权限
+	Mountpoint  string `json:"mountpoint"` // /mnt/openlist
+	AllowOther  bool   `json:"allow_other"`
+	DirCache    string `json:"dir_cache"`    // 默认 24h
+	AttrTime    string `json:"attr_time"`    // 默认 1h
+	VfsCacheMode string `json:"vfs_cache_mode"` // off / minimal / writes / full,默认 off
+	AutoStart   bool   `json:"auto_start"`  // 工具启动时是否自动挂载
 }
 
 // MountStatus 运行态。
@@ -148,6 +149,13 @@ func (s *Store) Upsert(c *MountConfig) error {
 	if c.AttrTime == "" {
 		c.AttrTime = "1h"
 	}
+	// 校验缓存模式,非法值回退到 off(只读友好)
+	switch c.VfsCacheMode {
+	case "off", "minimal", "writes", "full":
+		// ok
+	default:
+		c.VfsCacheMode = "off"
+	}
 	s.mu.Lock()
 	s.configs[c.ID] = c
 	s.mu.Unlock()
@@ -226,10 +234,14 @@ func (s *Store) Start(id string) error {
 	}
 
 	remoteName := "openlist_" + cfg.ID
+	vfsMode := cfg.VfsCacheMode
+	if vfsMode == "" {
+		vfsMode = "off"
+	}
 	args := []string{
 		"mount", remoteName + ":", cfg.Mountpoint,
 		"--config", s.rcloneConfPath(),
-		"--vfs-cache-mode", "off", // 不缓存文件内容,直接走网盘
+		"--vfs-cache-mode", vfsMode, // off/minimal/writes/full,用户可在 web 选择
 		"--dir-cache-time", cfg.DirCache, // 目录列表缓存(避免频繁 list 被限速)
 		"--attr-timeout", cfg.AttrTime, // 属性缓存
 		"--buffer-size", "32M",
