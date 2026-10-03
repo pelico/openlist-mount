@@ -1,63 +1,99 @@
-name: Build & Push to GHCR
+name: Release
 
+# 触发方式: 推 tag v*.*.* 或手动点 Run workflow
 on:
   push:
-    branches: [main]
     tags:
-      - 'v*'
+      - 'v*.*.*'
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name (e.g. v0.2.0)'
+        required: false
+        default: ''
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+permissions:
+  contents: write   # 创建 Release + 上传 assets 需要
 
 jobs:
   build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64 服务器
+          - { os: linux,  arch: amd64,   arm: ''    }
+          # 玩客云 / 树莓派 2/3 (armv7, 玩客云 S805)
+          - { os: linux,  arch: arm,     arm: '7'   }
+          # 树莓派 4/5 / 现代 NAS
+          - { os: linux,  arch: arm64,   arm: ''    }
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up QEMU (multi-arch emulation)
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+      - uses: actions/setup-go@v5
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          go-version: '1.25'
 
-      - name: Extract metadata (tags, labels)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=
-          labels: |
-            org.opencontainers.image.title=openlist-mount
-            org.opencontainers.image.description=Mount OpenList WebDAV as local FUSE filesystem via rclone
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+      - name: Build
+        env:
+          GOOS:   ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          GOARM:  ${{ matrix.arm }}
+          CGO_ENABLED: '0'
+        run: |
+          VERSION=${GITHUB_REF_NAME:-${{ github.event.inputs.tag_name }}}
+          # 没有 tag 时用 "dev-<sha>" 占位
+          [ -z "$VERSION" ] && VERSION="dev-${GITHUB_SHA::7}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
-      - name: Build and push multi-arch image
-        uses: docker/build-push-action@v5
+          SUFFIX="${GOOS}-${GOARCH}"
+          [ -n "$GOARM" ] && SUFFIX="${SUFFIX}v${GOARM}"
+          BIN="openlist-mount_${VERSION}_${SUFFIX}"
+
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+            -o "$BIN" .
+
+          # 额外打 tarball (附带 install.sh / uninstall.sh)
+          cp install.sh install.sh.bak
+          sed -i "s|VERSION=\"latest\"|VERSION=\"${VERSION}\"|" install.sh || true
+          tar czf "${BIN}.tar.gz" "$BIN" install.sh uninstall.sh systemd.go 2>/dev/null || \
+            tar czf "${BIN}.tar.gz" "$BIN" install.sh uninstall.sh
+          mv install.sh.bak install.sh
+
+          # 也放一份纯二进制
+          gzip -kf "$BIN"
+
+          ls -lh "${BIN}" "${BIN}.tar.gz" "${BIN}.gz"
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
         with:
-          context: .
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          name: ${{ env.BIN }}
+          path: |
+            ${{ env.BIN }}
+            ${{ env.BIN }}.tar.gz
+            ${{ env.BIN }}.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - run: ls -lh dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || github.event.inputs.tag_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') }}
+          files: |
+            dist/openlist-mount_*.tar.gz
+            dist/openlist-mount_*.gz
