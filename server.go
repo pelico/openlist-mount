@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 //go:embed web/*
@@ -45,6 +46,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("GET /api/mounts/{id}/log", s.handleLog)
 	mux.HandleFunc("POST /api/systemd", s.handleSystemd)
 	mux.HandleFunc("GET /api/rclone/check", s.handleRcloneCheck)
+	mux.HandleFunc("GET /api/health", s.handleHealth)
 
 	s.httpSrv = &http.Server{Addr: s.addr, Handler: mux}
 	return s.httpSrv.ListenAndServe()
@@ -199,6 +201,66 @@ func (s *Server) handleRcloneCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]interface{}{"installed": true, "version": ver})
+}
+
+// handleHealth 全局健康检查:返回 FUSE 支持、磁盘余量、以及每个挂载的 fuse_state。
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	// FUSE 支持探测
+	fuseOK := true
+	fuseHint := ""
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		fuseOK = false
+		fuseHint = "/dev/fuse 不存在,挂载会失败"
+	}
+	// /etc/fuse.conf 是否开 user_allow_other
+	faHint := ""
+	if b, err := os.ReadFile("/etc/fuse.conf"); err == nil {
+		if !strings.Contains(string(b), "user_allow_other") {
+			faHint = "建议在 /etc/fuse.conf 加 user_allow_other,配合 --allow-other 使用"
+		}
+	}
+
+	// 数据目录所在磁盘余量(仅 root 分区,粗略参考)
+	var disk map[string]uint64
+	if stat, err := os.Stat(s.store.dataDir); err == nil {
+		var fs syscall.Statfs_t
+		path := s.store.dataDir
+		_ = syscall.Statfs(path, &fs)
+		total := fs.Blocks * uint64(fs.Bsize)
+		free := fs.Bavail * uint64(fs.Bsize)
+		disk = map[string]uint64{
+			"total_bytes": total,
+			"free_bytes":  free,
+		}
+		_ = stat
+	}
+
+	// 每个挂载的状态
+	cfgs := s.store.List()
+	mounts := make([]map[string]interface{}, 0, len(cfgs))
+	for _, c := range cfgs {
+		st := s.store.Status(c.ID)
+		mounts = append(mounts, map[string]interface{}{
+			"id":        c.ID,
+			"name":      c.Name,
+			"mountpoint": c.Mountpoint,
+			"running":   st.Running,
+			"fuse_state": st.FuseState,
+			"last_error": st.LastError,
+		})
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"fuse": map[string]interface{}{
+			"available": fuseOK,
+			"hint":      fuseHint,
+		},
+		"fuse_conf_hint": faHint,
+		"data_dir":       s.store.dataDir,
+		"rclone_bin":     s.store.rcloneBin,
+		"disk":           disk,
+		"mounts":         mounts,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

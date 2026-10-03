@@ -16,25 +16,46 @@ import (
 // MountConfig 描述单个 openlist 挂载项。
 type MountConfig struct {
 	ID          string `json:"id"`
-	Name        string `json:"name"`        // 友好显示名
-	URL         string `json:"url"`        // openlist WebDAV 根地址,如 http://192.168.1.2:5244/dav
+	Name        string `json:"name"`             // 友好显示名
+	URL         string `json:"url"`              // openlist WebDAV 根地址,如 http://192.168.1.2:5244/dav
 	Username    string `json:"username"`
-	Password    string `json:"password"`   // 明文,仅在内存与 config.json 中,本地落盘注意权限
-	Mountpoint  string `json:"mountpoint"` // /mnt/openlist
+	Password    string `json:"password"`         // 明文,仅在内存与 config.json 中,本地落盘注意权限
+	Mountpoint  string `json:"mountpoint"`       // /mnt/openlist
 	AllowOther  bool   `json:"allow_other"`
-	DirCache    string `json:"dir_cache"`    // 默认 24h
-	AttrTime    string `json:"attr_time"`    // 默认 1h
-	VfsCacheMode string `json:"vfs_cache_mode"` // off / minimal / writes / full,默认 off
-	AutoStart   bool   `json:"auto_start"`  // 工具启动时是否自动挂载
+	DirCache    string `json:"dir_cache"`        // 默认 24h
+	AttrTime    string `json:"attr_time"`        // 默认 1h
+	VfsCacheMode string `json:"vfs_cache_mode"`  // off / minimal / writes / full,默认 off
+	AutoStart   bool   `json:"auto_start"`       // 工具启动时是否自动挂载
+
+	// ---- 新增:缓存精细化控制 ----
+	// CacheDir rclone 本地缓存目录(不填则用 rclone 默认位置)。
+	// 小设备建议指向 tmpfs,如 /tmp/rclone-cache。
+	CacheDir string `json:"cache_dir"`
+	// VfsCacheMaxSize 单个挂载本地缓存上限,如 "10G"、"500M"。空表示不限制(不推荐)。
+	VfsCacheMaxSize string `json:"vfs_cache_max_size"`
+	// VfsCacheMaxAge 缓存文件最久保留时间,如 "24h"、"7d"。空表示不自动过期。
+	VfsCacheMaxAge string `json:"vfs_cache_max_age"`
+	// VfsCachePollInterval 缓存扫描周期,默认 1m,小设备建议 5m 或更长。
+	VfsCachePollInterval string `json:"vfs_cache_poll_interval"`
+
+	// ---- 新增:内存 / 并发控制 (防小设备 OOM) ----
+	// BufferSize 每个传输的内存缓冲,默认 "32M",小设备建议 "8M" 或 "16M"。
+	BufferSize string `json:"buffer_size"`
+	// Transfers 并发传输数,默认 4,小设备建议 1 或 2。
+	Transfers int `json:"transfers"`
+	// MaxReadAhead FUSE 预读缓冲,默认 128K,摄像头场景 64K 足够。
+	MaxReadAhead string `json:"max_read_ahead"`
 }
 
 // MountStatus 运行态。
 type MountStatus struct {
-	ID       string `json:"id"`
-	Running  bool   `json:"running"`
-	PID      int    `json:"pid"`
+	ID        string    `json:"id"`
+	Running   bool      `json:"running"`
+	PID       int       `json:"pid"`
 	StartedAt time.Time `json:"started_at,omitempty"`
-	LastError string  `json:"last_error,omitempty"`
+	LastError string    `json:"last_error,omitempty"`
+	// 新增:最近一次探测的 FUSE 健康度("ok" 或 "stale")
+	FuseState string `json:"fuse_state,omitempty"`
 }
 
 // Store 负责配置持久化 + rclone 进程生命周期。
@@ -46,12 +67,14 @@ type Store struct {
 	procs     map[string]*runningProc // 运行中的 rclone 进程
 }
 
+// runningProc 代表一个运行中的 rclone mount 进程 + 它的保护协程。
 type runningProc struct {
-	cmd        *exec.Cmd
-	pidFile    string
-	startedAt  time.Time
-	lastError  string
-	stopCh     chan struct{}
+	cmd          *exec.Cmd
+	pidFile      string
+	startedAt    time.Time
+	lastError    string
+	stopCh       chan struct{}
+	monitorDone  chan struct{} // 用于等待监控 goroutine 退出
 }
 
 func NewStore(dataDir, rcloneBin string) (*Store, error) {
@@ -70,9 +93,9 @@ func NewStore(dataDir, rcloneBin string) (*Store, error) {
 	return s, nil
 }
 
-func (s *Store) configPath() string { return filepath.Join(s.dataDir, "config.json") }
-func (s *Store) pidDir() string     { return filepath.Join(s.dataDir, "pids") }
-func (s *Store) rcloneConfPath() string { return filepath.Join(s.dataDir, "rclone.conf") }
+func (s *Store) configPath() string      { return filepath.Join(s.dataDir, "config.json") }
+func (s *Store) pidDir() string          { return filepath.Join(s.dataDir, "pids") }
+func (s *Store) rcloneConfPath() string  { return filepath.Join(s.dataDir, "rclone.conf") }
 
 // load 从 config.json 载入配置。
 func (s *Store) load() error {
@@ -98,7 +121,6 @@ func (s *Store) save() error {
 	s.mu.RLock()
 	list := make([]*MountConfig, 0, len(s.configs))
 	for _, c := range s.configs {
-		// 复制避免外部修改
 		cc := *c
 		list = append(list, &cc)
 	}
@@ -136,6 +158,7 @@ func (s *Store) Get(id string) (*MountConfig, bool) {
 }
 
 // Upsert 新增或更新配置。
+// 默认值基于极限资源场景设计:玩客云 8G 盘剩 2-3G + 1G RAM + 多路摄像头。
 func (s *Store) Upsert(c *MountConfig) error {
 	if c.ID == "" {
 		return errors.New("id required")
@@ -143,19 +166,55 @@ func (s *Store) Upsert(c *MountConfig) error {
 	if c.URL == "" || c.Mountpoint == "" {
 		return errors.New("url and mountpoint required")
 	}
+	// 目录/属性缓存:小设备用长缓存减少 FUSE 开销
 	if c.DirCache == "" {
-		c.DirCache = "24h"
+		c.DirCache = "1h"
 	}
 	if c.AttrTime == "" {
-		c.AttrTime = "1h"
+		c.AttrTime = "30s"
 	}
-	// 校验缓存模式,非法值回退到 off(只读友好)
+	// 缓存模式:默认 writes(摄像头/Samba 写入场景必需)
 	switch c.VfsCacheMode {
-	case "off", "minimal", "writes", "full":
-		// ok
+	case "", "off", "minimal", "writes", "full":
+		if c.VfsCacheMode == "" {
+			c.VfsCacheMode = "writes"
+		}
 	default:
-		c.VfsCacheMode = "off"
+		c.VfsCacheMode = "writes"
 	}
+
+	// ---- 极限资源默认值 ----
+	// 缓存目录:tmpfs 内存中转,磁盘零写入(玩客云磁盘不够)
+	if c.CacheDir == "" {
+		c.CacheDir = "/tmp/rclone-cache"
+	}
+	// 缓存上限:tmpfs 吃内存,500M 是玩客云能承受的上限(1G RAM 里挤)
+	if c.VfsCacheMaxSize == "" {
+		c.VfsCacheMaxSize = "500M"
+	}
+	// 缓存最久:5 分钟上传完立即删,不留
+	if c.VfsCacheMaxAge == "" {
+		c.VfsCacheMaxAge = "5m"
+	}
+	// 扫描周期:1 分钟扫一次,赶紧清过期文件
+	if c.VfsCachePollInterval == "" {
+		c.VfsCachePollInterval = "1m"
+	}
+
+	// ---- 内存/并发:极小值,玩客云 1G RAM 里挤 ----
+	// 并发:1 个一个串行传,省内存省 OpenList 后端压力
+	if c.Transfers <= 0 {
+		c.Transfers = 1
+	}
+	// 单传输缓冲:8M 够了,摄像头 MP4 是顺序写
+	if c.BufferSize == "" {
+		c.BufferSize = "8M"
+	}
+	// FUSE 预读:0,摄像头是顺序写,不需要预读
+	if c.MaxReadAhead == "" {
+		c.MaxReadAhead = "0"
+	}
+
 	s.mu.Lock()
 	s.configs[c.ID] = c
 	s.mu.Unlock()
@@ -193,8 +252,66 @@ func (s *Store) Status(id string) MountStatus {
 		st.PID = p.cmd.Process.Pid
 		st.StartedAt = p.startedAt
 		st.LastError = p.lastError
+		// 探测 FUSE 挂载点是否健康
+		st.FuseState = probeFuseHealth(p.cmd.Process.Pid)
 	}
 	return st
+}
+
+// probeFuseHealth 快速探测 rclone FUSE 挂载点是否"真的活着"。
+// 返回 "ok" / "stale" / "unknown"。
+func probeFuseHealth(pid int) string {
+	if pid <= 0 {
+		return "unknown"
+	}
+	// 看 /proc/<pid>/cmdline 里有没有 rclone mount
+	cmd, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil || !strings.Contains(string(cmd), "rclone") {
+		return "stale"
+	}
+	// 另一种方式:进程是否在运行
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return "stale"
+	}
+	// 在 Unix 上 FindProcess 不会失败,只能通过发 signal=0 探测
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
+		return "stale"
+	}
+	return "ok"
+}
+
+// cleanupStaleMount 尝试多种方法清理僵尸 FUSE 挂载。
+func cleanupStaleMount(mountpoint string) error {
+	if mountpoint == "" {
+		return nil
+	}
+	// 方法 1:正常 Unmount
+	if err := syscall.Unmount(mountpoint, 0); err == nil {
+		return nil
+	}
+	time.Sleep(300 * time.Millisecond)
+	// 方法 2:lazy + force
+	if err := syscall.Unmount(mountpoint, syscall.MNT_FORCE); err == nil {
+		return nil
+	}
+	time.Sleep(300 * time.Millisecond)
+	// 方法 3:fusermount -uF
+	if _, err := exec.LookPath("fusermount"); err == nil {
+		if err := exec.Command("fusermount", "-u", mountpoint).Run(); err == nil {
+			return nil
+		}
+		if err := exec.Command("fusermount", "-uF", mountpoint).Run(); err == nil {
+			return nil
+		}
+	}
+	// 方法 4:umount -l
+	if _, err := exec.LookPath("umount"); err == nil {
+		if err := exec.Command("umount", "-lf", mountpoint).Run(); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("failed to clean stale mount at %s", mountpoint)
 }
 
 // Start 启动 rclone mount 子进程。
@@ -218,9 +335,12 @@ func (s *Store) Start(id string) error {
 		return fmt.Errorf("mkdir mountpoint: %w", err)
 	}
 
-	// 若已挂载(比如上次残留),先尝试 umount
+	// 多策略清理残留挂载(包括 FUSE 僵尸)
 	if isMounted(cfg.Mountpoint) {
-		_ = syscall.Unmount(cfg.Mountpoint, 0)
+		if err := cleanupStaleMount(cfg.Mountpoint); err != nil {
+			// 即使清理失败也继续:可能是已卸载但 stat 还在
+			fmt.Fprintf(os.Stderr, "clean stale mount: %v\n", err)
+		}
 		time.Sleep(500 * time.Millisecond)
 	}
 
@@ -241,15 +361,38 @@ func (s *Store) Start(id string) error {
 	args := []string{
 		"mount", remoteName + ":", cfg.Mountpoint,
 		"--config", s.rcloneConfPath(),
-		"--vfs-cache-mode", vfsMode, // off/minimal/writes/full,用户可在 web 选择
-		"--dir-cache-time", cfg.DirCache, // 目录列表缓存(避免频繁 list 被限速)
-		"--attr-timeout", cfg.AttrTime, // 属性缓存
-		"--buffer-size", "32M",
+		"--vfs-cache-mode", vfsMode,
+		"--dir-cache-time", cfg.DirCache,
+		"--attr-timeout", cfg.AttrTime,
+		"--buffer-size", cfg.BufferSize,
+		"--transfers", fmt.Sprintf("%d", cfg.Transfers),
+		"--max-read-ahead", cfg.MaxReadAhead,
 		"--log-level", "INFO",
 		"--log-file", filepath.Join(s.dataDir, cfg.ID+".log"),
 	}
 	if cfg.AllowOther {
 		args = append(args, "--allow-other")
+	}
+
+	// 缓存目录(用户指定则用,否则 rclone 自己决定)
+	if cfg.CacheDir != "" {
+		if err := os.MkdirAll(cfg.CacheDir, 0o755); err != nil {
+			return fmt.Errorf("mkdir cache dir %s: %w", cfg.CacheDir, err)
+		}
+		args = append(args, "--cache-dir", cfg.CacheDir)
+	}
+
+	// 只有用了缓存模式才加这些参数
+	if vfsMode != "off" {
+		if cfg.VfsCacheMaxSize != "" {
+			args = append(args, "--vfs-cache-max-size", cfg.VfsCacheMaxSize)
+		}
+		if cfg.VfsCacheMaxAge != "" {
+			args = append(args, "--vfs-cache-max-age", cfg.VfsCacheMaxAge)
+		}
+		if cfg.VfsCachePollInterval != "" {
+			args = append(args, "--vfs-cache-poll-interval", cfg.VfsCachePollInterval)
+		}
 	}
 
 	cmd := exec.Command(s.rcloneBin, args...)
@@ -263,27 +406,64 @@ func (s *Store) Start(id string) error {
 	_ = os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", cmd.Process.Pid)), 0o644)
 
 	proc := &runningProc{
-		cmd:       cmd,
-		pidFile:   pidFile,
-		startedAt: time.Now(),
-		stopCh:    make(chan struct{}),
+		cmd:          cmd,
+		pidFile:      pidFile,
+		startedAt:    time.Now(),
+		stopCh:       make(chan struct{}),
+		monitorDone:  make(chan struct{}),
 	}
 
 	s.mu.Lock()
 	s.procs[id] = proc
 	s.mu.Unlock()
 
-	// 后台监控,捕获退出
+	// 后台 1:捕获 rclone 退出
 	go func() {
 		err := cmd.Wait()
 		s.mu.Lock()
-		if proc, ok := s.procs[id]; ok {
+		if p, ok := s.procs[id]; ok {
 			if err != nil {
-				proc.lastError = err.Error()
+				p.lastError = err.Error()
 			}
 		}
 		s.mu.Unlock()
 		_ = os.Remove(pidFile)
+	}()
+
+	// 后台 2:磁盘水位保护(小设备防爆盘)
+	// 每 60 秒检查挂载点所在磁盘,剩余 < 5% 时给 rclone 发 SIGTERM
+	go func() {
+		defer close(proc.monitorDone)
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-proc.stopCh:
+				return
+			case <-ticker.C:
+				// 优先检查挂载点所在磁盘(Samba 实际写入的地方)
+				// 其次检查 data 目录(tmpfs cache-dir 不检查,tmpfs 剩余=内存剩余)
+				path := cfg.Mountpoint
+				if path == "" {
+					path = s.dataDir
+				}
+				pct, free := diskFreePct(path)
+				if free >= 0 && pct < 10 {
+					fmt.Fprintf(os.Stderr,
+						"[ALERT] mount %s disk %.2f%% (free %d bytes) < 10%%, force-stopping rclone\n",
+						id, pct, free)
+					if proc.cmd.Process != nil {
+						_ = proc.cmd.Process.Signal(syscall.SIGTERM)
+						time.AfterFunc(5*time.Second, func() {
+							if proc.cmd.Process != nil && !proc.cmd.ProcessState.Exited() {
+								_ = proc.cmd.Process.Kill()
+							}
+						})
+					}
+					return
+				}
+			}
+		}
 	}()
 
 	return nil
@@ -312,6 +492,8 @@ func (s *Store) Stop(id string) error {
 	if proc.cmd.Process != nil {
 		_ = proc.cmd.Process.Signal(syscall.SIGTERM)
 	}
+	// 通知监控 goroutine 退出(关闭 stopCh 触发 select 分支)
+	close(proc.stopCh)
 	// 用 timer 实现 5s 后强杀
 	timer := time.AfterFunc(5*time.Second, func() {
 		if proc.cmd.Process != nil {
@@ -320,13 +502,18 @@ func (s *Store) Stop(id string) error {
 	})
 	defer timer.Stop()
 	_ = proc.cmd.Wait()
+	// 等监控 goroutine 也退出(最多 1s)
+	select {
+	case <-proc.monitorDone:
+	case <-time.After(1 * time.Second):
+	}
 	_ = os.Remove(proc.pidFile)
 	s.mu.Lock()
 	delete(s.procs, id)
 	s.mu.Unlock()
-	// 残留挂载强制卸载
-	if mountpoint != "" && isMounted(mountpoint) {
-		_ = syscall.Unmount(mountpoint, syscall.MNT_FORCE)
+	// 残留挂载多策略卸载
+	if mountpoint != "" {
+		_ = cleanupStaleMount(mountpoint)
 	}
 	return nil
 }
@@ -414,4 +601,22 @@ func readPIDFile(p string) (int, error) {
 		return 0, err
 	}
 	return pid, nil
+}
+
+// diskFreePct 返回 path 所在磁盘的剩余百分比 (0-100) 和剩余字节数。
+// 出错时返回 (-1, -1)。
+func diskFreePct(path string) (float64, int64) {
+	if path == "" {
+		return -1, -1
+	}
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return -1, -1
+	}
+	total := stat.Blocks * uint64(stat.Bsize)
+	free := stat.Bavail * uint64(stat.Bsize)
+	if total == 0 {
+		return -1, -1
+	}
+	return float64(free) / float64(total) * 100.0, int64(free)
 }

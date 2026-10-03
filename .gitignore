@@ -1,0 +1,5 @@
+dist/
+*.log
+config.json
+rclone.conf
+pids/

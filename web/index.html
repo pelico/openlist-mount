@@ -10,6 +10,7 @@
 <header>
   <h1>openlist-mount</h1>
   <div id="rclone-status" class="rclone-badge">检查 rclone 中…</div>
+  <div id="health-hint" class="health-hint"></div>
 </header>
 
 <main>
@@ -31,23 +32,65 @@
       <label>挂载点
         <input name="mountpoint" required placeholder="/mnt/openlist">
       </label>
+
       <label>目录缓存
         <input name="dir_cache" placeholder="24h">
       </label>
       <label>属性缓存
         <input name="attr_time" placeholder="1h">
       </label>
-      <label>缓存模式
+
+      <label>缓存模式 <span class="hint-inline">摄像头/备份场景建议用 writes 或 full</span>
         <select name="vfs_cache_mode">
-          <option value="off" selected>off - 不缓存(只读友好,默认)</option>
+          <option value="off">off - 不缓存(只读友好,写入直接透传 WebDAV)</option>
           <option value="minimal">minimal - 仅缓存已打开的文件</option>
-          <option value="writes">writes - 写入先落本地再上传(推荐写入场景)</option>
-          <option value="full">full - 全部缓存(最稳,占磁盘)</option>
+          <option value="writes" selected>writes - 写入先落本地缓存再上传(推荐:摄像头/Samba 写入)</option>
+          <option value="full">full - 读写全部缓存(最稳,占本地磁盘,适合小设备)</option>
         </select>
       </label>
+
+      <!-- 仅非 off 模式生效:缓存精细化控制 -->
+      <details class="adv" open>
+        <summary>高级缓存设置(展开) ← 小设备建议保留默认值</summary>
+        <div class="adv-grid">
+          <label>本地缓存上限 <span class="hint-inline">极限盘剩 2-3G 用 500M</span>
+            <input name="vfs_cache_max_size" value="500M">
+          </label>
+          <label>缓存最久保留 <span class="hint-inline">5 分钟传完立即删</span>
+            <input name="vfs_cache_max_age" value="5m">
+          </label>
+          <label>缓存扫描周期 <span class="hint-inline">1m 频繁扫</span>
+            <input name="vfs_cache_poll_interval" value="1m">
+          </label>
+          <label>缓存目录 <span class="hint-inline">tmpfs 内存中转,磁盘零写入</span>
+            <input name="cache_dir" value="/tmp/rclone-cache">
+          </label>
+        </div>
+      </details>
+
+      <!-- 内存/并发控制 (小设备特别注意) -->
+      <details class="adv" open>
+        <summary>内存 / 并发控制(防 OOM, 玩客云 1G RAM 重点关注)</summary>
+        <div class="adv-grid">
+          <label>并发传输数
+            <input name="transfers" type="number" min="1" max="8" value="1">
+          </label>
+          <label>单传输内存缓冲
+            <input name="buffer_size" value="8M">
+          </label>
+          <label>FUSE 预读缓冲 <span class="hint-inline">0=关闭,摄像头顺序写不需要</span>
+            <input name="max_read_ahead" value="0">
+          </label>
+          <p class="hint-inline" style="grid-column: 1 / -1;">
+            🧮 内存极限 ≈ transfers(1) × buffer(8M) + FUSE(30M) = <b>38MB</b> <br>
+            🗄 缓存走 tmpfs,磁盘零写入,磁盘水位 < 10% 自动停 rclone
+          </p>
+        </div>
+      </details>
+
       <label class="checkbox">
-        <input name="allow_other" type="checkbox">
-        <span>允许其他用户访问 (--allow-other, 给 Samba 用)</span>
+        <input name="allow_other" type="checkbox" checked>
+        <span>允许其他用户访问 <code>(--allow-other)</code> Samba/NFS 共享依赖这个</span>
       </label>
       <label class="checkbox">
         <input name="auto_start" type="checkbox">
