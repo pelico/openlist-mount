@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -330,6 +331,9 @@ func (s *Store) Start(id string) error {
 	}
 	s.mu.Unlock()
 
+	// 先 kill 掉这个挂载点残留的 rclone 进程 (僵尸挂载/上次 Stop 不彻底)
+	s.killRcloneForMountpoint(cfg.Mountpoint)
+
 	// 准备挂载点
 	if err := os.MkdirAll(cfg.Mountpoint, 0o755); err != nil {
 		return fmt.Errorf("mkdir mountpoint: %w", err)
@@ -361,6 +365,7 @@ func (s *Store) Start(id string) error {
 	args := []string{
 		"mount", remoteName + ":", cfg.Mountpoint,
 		"--config", s.rcloneConfPath(),
+		"--allow-non-empty",
 		"--vfs-cache-mode", vfsMode,
 		"--dir-cache-time", cfg.DirCache,
 		"--attr-timeout", cfg.AttrTime,
@@ -516,6 +521,43 @@ func (s *Store) Stop(id string) error {
 		_ = cleanupStaleMount(mountpoint)
 	}
 	return nil
+}
+
+// killRcloneForMountpoint 用 pgrep+kill 干掉所有命令行里带这个挂载点的 rclone 进程。
+// 用于 Start() 前清残留, 避免 FUSE 僵尸或重复挂载。
+func (s *Store) killRcloneForMountpoint(mountpoint string) {
+	if mountpoint == "" {
+		return
+	}
+	// pgrep -f "rclone mount <mountpoint>" → 拿到 PID
+	out, err := exec.Command("pgrep", "-f", "rclone mount .* "+mountpoint).Output()
+	if err != nil || len(out) == 0 {
+		return // 没残留
+	}
+	pids := strings.Fields(string(out))
+	for _, pidStr := range pids {
+		if pid, err := strconv.Atoi(pidStr); err == nil && pid > 1 {
+			proc, err := os.FindProcess(pid)
+			if err == nil {
+				_ = proc.Signal(syscall.SIGTERM)
+			}
+		}
+	}
+	// 等 1s, 还活着就强杀
+	time.Sleep(1 * time.Second)
+	out2, _ := exec.Command("pgrep", "-f", "rclone mount .* "+mountpoint).Output()
+	if len(out2) > 0 {
+		pids2 := strings.Fields(string(out2))
+		for _, pidStr := range pids2 {
+			if pid, err := strconv.Atoi(pidStr); err == nil && pid > 1 {
+				proc, err := os.FindProcess(pid)
+				if err == nil {
+					_ = proc.Kill()
+				}
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 // RestoreAll 启动时根据 AutoStart 字段恢复运行态。
