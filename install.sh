@@ -59,12 +59,13 @@ fi
 # ---- 2. 架构检测 ----
 ARCH_RAW=$(uname -m)
 case "$ARCH_RAW" in
-  aarch64|arm64)  ARCH=arm64 ;;
-  armv7l|armv6l|armhf) ARCH=armhf; [ "$ARCH_RAW" = "armv6l" ] && warn "armv6 可能需要 GOARM=6 重新编译,尝试 armhf..." ;;
-  x86_64|amd64)   ARCH=arm64; warn "x86_64 主机不在本工具设计目标,但二进制仍可运行" ;;
-  *)              die "不支持的架构: $ARCH_RAW" ;;
+  aarch64|arm64)      ARCH=arm64 ;;
+  armv7l|armhf)       ARCH=armv7 ;;      # 玩客云 / 树莓派 2/3 (S805 就是 armv7)
+  armv6l)             ARCH=armv6 ;;
+  x86_64|amd64)       ARCH=amd64 ;;
+  *)                  die "不支持的架构: $ARCH_RAW" ;;
 esac
-ok "检测到架构: $ARCH_RAW → $ARCH"
+ok "检测到架构: $ARCH_RAW → openlist-mount-$ARCH"
 
 # ---- 3. 包管理器 ----
 PKG=""
@@ -167,6 +168,28 @@ if ! head -c 4 "$TMP_BIN" | grep -q $'\x7fELF'; then
   die "二进制校验失败"
 fi
 ok "二进制就绪: $(du -h "$TMP_BIN" | cut -f1)"
+
+# ---- 6.5 停旧进程 + 清僵尸 FUSE (升级场景必需) ----
+OLD_RUNNING=0
+if systemctl is-active --quiet openlist-mount.service 2>/dev/null; then
+  log "检测到旧服务在跑,停掉..."
+  systemctl stop openlist-mount.service 2>/dev/null || true
+  sleep 2
+  OLD_RUNNING=1
+fi
+# 强制清理所有 openlist-mount 相关残留进程和 FUSE 挂载
+pkill -9 -f "openlist-mount" 2>/dev/null || true
+pkill -9 -f "rclone mount" 2>/dev/null || true
+sleep 1
+# 清理僵尸 FUSE (遍历挂载点自动卸)
+if command -v fusermount3 >/dev/null 2>&1; then
+  fusermount3 -uF /DATA/* 2>/dev/null || true
+fi
+if command -v fusermount >/dev/null 2>&1; then
+  fusermount -uF /DATA/* 2>/dev/null || true
+fi
+umount -lf /DATA/* 2>/dev/null || true
+sleep 1
 
 install -m 0755 "$TMP_BIN" "$INSTALL_BIN"
 INSTALL_DONE=1
