@@ -22,10 +22,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 注意: install.sh 按 uname -m 映射期望的 ARCH 命名
-          - { arch: amd64, target: linux/amd64,          suffix: ''   }
-          - { arch: armv7, target: linux/arm/v7,          suffix: ''   }   # 玩客云 S805
-          - { arch: arm64, target: linux/arm64,           suffix: ''   }
+          - { arch: amd64 }
+          - { arch: armv7 }
+          - { arch: arm64 }
 
     steps:
       - uses: actions/checkout@v4
@@ -43,9 +42,7 @@ jobs:
           [ -z "$VERSION" ] && VERSION="dev-${GITHUB_SHA::7}"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
-          # matrix.arch 已经是 install.sh 约定的名字 (amd64/armv7/arm64)
           ARCH_NAME="${{ matrix.arch }}"
-          # 映射到 Go 编译器的 GOARCH + GOARM
           case "$ARCH_NAME" in
             amd64)  GOARCH=amd64; GOARM=   ;;
             armv7)  GOARCH=arm;   GOARM=7 ;;
@@ -54,15 +51,16 @@ jobs:
           esac
           echo "GOARCH=$GOARCH GOARM=$GOARM"
 
-          # install.sh 约定的裸二进制名 (不带版本,按 ARCH)
+          # install.sh 约定的裸二进制名 (不带版本,不带平台)
           BIN_BARE="openlist-mount-${ARCH_NAME}"
-          # 带版本+平台的完整名
+          # 带版本+平台的完整名 (手动下载友好)
           BIN_VER="openlist-mount_${VERSION}_linux-${ARCH_NAME}"
 
           GOARCH="$GOARCH" GOARM="$GOARM" go build -trimpath \
             -ldflags="-s -w -X main.version=${VERSION}" \
             -o "$BIN_BARE" .
 
+          # 同时拷一份带版本的名字,方便用户手动下载
           cp "$BIN_BARE" "$BIN_VER"
 
           # tarball (带 install.sh + uninstall.sh)
@@ -70,18 +68,19 @@ jobs:
             --transform "s|^${BIN_BARE}|openlist-mount|" \
             "$BIN_BARE" install.sh uninstall.sh
 
-          # 裸二进制 gz
           gzip -kf "$BIN_VER"
 
           ls -lh openlist-mount-* openlist-mount_* 2>/dev/null
           echo "BIN_BARE=$BIN_BARE" >> "$GITHUB_ENV"
           echo "BIN_VER=$BIN_VER" >> "$GITHUB_ENV"
 
+      # 上传本架构的 4 个文件: 裸二进制 + 带版本名 + tar.gz + gz
+      # artifact 名=BIN_VER, 方便 download-artifact 合并
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BIN_VER }}
           path: |
-            ${{ env.BIN_BARE }}       # ← install.sh 约定的名字
+            ${{ env.BIN_BARE }}
             ${{ env.BIN_VER }}
             ${{ env.BIN_VER }}.tar.gz
             ${{ env.BIN_VER }}.gz
@@ -90,12 +89,38 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # merge-multiple: true → 所有架构的 artifact 内容扁平合并到 dist/ 下
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
+      # download-artifact v4 默认每个 artifact 解到同名子目录
+      # merge-multiple: true 会把所有子目录里的文件扁平化合并到 path 根
+      # 但不同 artifact 里如果有同名文件会冲突,这里每个架构独立名不会冲突
       - run: ls -lh dist/
+
+      # 关键: 确保 dist/ 下有 install.sh 约定的裸二进制
+      # (download-artifact 可能没保留 build 时的目录结构,保险起见重命名一次)
+      - name: Ensure bare binaries exist
+        run: |
+          cd dist
+          for arch in amd64 armv7 arm64; do
+            # 优先用已经存在的裸二进制
+            if [ -f "openlist-mount-${arch}" ]; then
+              echo "✅ openlist-mount-${arch} 已存在"
+              continue
+            fi
+            # 退化: 从带版本+平台名的文件 cp 一份过去
+            src=$(ls -1 openlist-mount_*_linux-${arch} 2>/dev/null | grep -v '\.tar\.gz$' | grep -v '\.gz$' | head -1)
+            if [ -n "$src" ]; then
+              cp "$src" "openlist-mount-${arch}"
+              echo "cp $src → openlist-mount-${arch}"
+            fi
+          done
+          ls -lh openlist-mount-*
+          echo "--- 全部产物 ---"
+          ls -lh
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -103,8 +128,8 @@ jobs:
           tag_name: ${{ github.ref_name || github.event.inputs.tag_name }}
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') }}
-          # glob 匹配所有产物 (install.sh 约定的裸二进制 + 带版本的包)
+          # 注意: glob 后别加任何注释! action-gh-release 会把整行当 pattern
           files: |
-            dist/openlist-mount-*             # ← install.sh 用
-            dist/openlist-mount_*.tar.gz      # ← 用户手动下载
-            dist/openlist-mount_*.gz          # ← 用户手动下载
+            dist/openlist-mount-*
+            dist/openlist-mount_*.tar.gz
+            dist/openlist-mount_*.gz
