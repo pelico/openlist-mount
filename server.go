@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 )
 
 //go:embed web/*
@@ -44,7 +43,10 @@ func (s *Server) Start() error {
 	mux.HandleFunc("POST /api/mounts/{id}/stop", s.handleStop)
 	mux.HandleFunc("GET /api/mounts/{id}/status", s.handleStatus)
 	mux.HandleFunc("GET /api/mounts/{id}/log", s.handleLog)
+	mux.HandleFunc("GET /api/mounts/{id}/cache", s.handleCache)
+	mux.HandleFunc("POST /api/mounts/{id}/cache/clean", s.handleCleanCache)
 	mux.HandleFunc("POST /api/systemd", s.handleSystemd)
+	mux.HandleFunc("GET /api/storage", s.handleStorage)
 	mux.HandleFunc("GET /api/rclone/check", s.handleRcloneCheck)
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 
@@ -172,6 +174,61 @@ func (s *Server) handleLog(w http.ResponseWriter, r *http.Request) {
 // 注意:filepath 已在 mount.go 中引入,这里直接复用
 
 
+// handleCache 返回某挂载的本地缓存占用。
+func (s *Server) handleCache(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	cfg, ok := s.store.Get(id)
+	if !ok {
+		http.Error(w, "not found", 404)
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"id":          id,
+		"cache_dir":   cfg.CacheDir,
+		"cache_bytes": s.store.CacheSize(id),
+	})
+}
+
+// handleCleanCache 一键清空某挂载的本地缓存(缓存盘占满时的急救手段)。
+func (s *Server) handleCleanCache(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	freed, err := s.store.CleanCache(id)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"status": "cleaned", "freed_bytes": freed})
+}
+
+// handleStorage 返回各挂载缓存目录所在磁盘的可用/总容量,以及各自当前的缓存占用。
+func (s *Server) handleStorage(w http.ResponseWriter, r *http.Request) {
+	cfgs := s.store.List()
+	mounts := make([]map[string]interface{}, 0, len(cfgs))
+	for _, c := range cfgs {
+		m := map[string]interface{}{
+			"id":          c.ID,
+			"name":        c.Name,
+			"cache_dir":   c.CacheDir,
+			"cache_bytes": s.store.CacheSize(c.ID),
+		}
+		if total, free, ok := diskUsageNearest(c.CacheDir); ok {
+			m["total_bytes"] = total
+			m["free_bytes"] = free
+		}
+		mounts = append(mounts, m)
+	}
+	resp := map[string]interface{}{
+		"data_dir": s.store.dataDir,
+		"mounts":   mounts,
+	}
+	if total, free, ok := diskUsage(s.store.dataDir); ok {
+		resp["data_total_bytes"] = total
+		resp["data_free_bytes"] = free
+	}
+	writeJSON(w, resp)
+}
+
+
 func (s *Server) handleSystemd(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ExecPath string `json:"exec_path"`
@@ -181,7 +238,7 @@ func (s *Server) handleSystemd(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	if req.ExecPath == "" {
 		// 默认用当前可执行路径
-		req.ExecPath = "/usr/local/bin/openlist-mount"
+		req.ExecPath = defaultExecPath()
 	}
 	if req.Addr == "" {
 		req.Addr = s.addr
@@ -189,7 +246,7 @@ func (s *Server) handleSystemd(w http.ResponseWriter, r *http.Request) {
 	if req.DataDir == "" {
 		req.DataDir = s.store.dataDir
 	}
-	unit := renderSystemdUnit(req.ExecPath, req.Addr, req.DataDir)
+	unit := renderServiceUnit(req.ExecPath, req.Addr, req.DataDir)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte(unit))
 }
@@ -203,43 +260,29 @@ func (s *Server) handleRcloneCheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"installed": true, "version": ver})
 }
 
-// handleHealth 全局健康检查:返回 FUSE 支持、磁盘余量、以及每个挂载的 fuse_state。
+// handleHealth 全局健康检查:返回平台虚拟文件系统支持、磁盘余量、以及每个挂载的 fuse_state。
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	// FUSE 支持探测
-	fuseOK := true
-	fuseHint := ""
-	if _, err := os.Stat("/dev/fuse"); err != nil {
-		fuseOK = false
-		fuseHint = "/dev/fuse 不存在,挂载会失败"
-	}
-	// /etc/fuse.conf 是否开 user_allow_other
-	faHint := ""
-	if b, err := os.ReadFile("/etc/fuse.conf"); err == nil {
-		if !strings.Contains(string(b), "user_allow_other") {
-			faHint = "建议在 /etc/fuse.conf 加 user_allow_other,配合 --allow-other 使用"
-		}
-	}
+	// 平台虚拟文件系统探测(Linux: FUSE;Windows: WinFsp)
+	fuseOK, fuseHint, faHint := fuseHealth()
 
-	// 数据目录所在磁盘余量(仅 root 分区,粗略参考)
+	// 数据目录所在磁盘余量
 	var disk map[string]uint64
-	if stat, err := os.Stat(s.store.dataDir); err == nil {
-		var fs syscall.Statfs_t
-		path := s.store.dataDir
-		_ = syscall.Statfs(path, &fs)
-		total := fs.Blocks * uint64(fs.Bsize)
-		free := fs.Bavail * uint64(fs.Bsize)
+	if total, free, ok := diskUsage(s.store.dataDir); ok {
 		disk = map[string]uint64{
 			"total_bytes": total,
 			"free_bytes":  free,
 		}
-		_ = stat
 	}
 
 	// 每个挂载的状态
 	cfgs := s.store.List()
 	mounts := make([]map[string]interface{}, 0, len(cfgs))
+	cacheDir := ""
 	for _, c := range cfgs {
 		st := s.store.Status(c.ID)
+		if cacheDir == "" && c.CacheDir != "" {
+			cacheDir = c.CacheDir
+		}
 		mounts = append(mounts, map[string]interface{}{
 			"id":        c.ID,
 			"name":      c.Name,
@@ -247,10 +290,27 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			"running":   st.Running,
 			"fuse_state": st.FuseState,
 			"last_error": st.LastError,
+			"warning":    st.Warning,
+			"upload_failures": st.UploadFailures,
+			"upload_error":    st.UploadError,
 		})
 	}
 
+	// 缓存目录所在磁盘(真正会被写满的那张盘)
+	var storage map[string]interface{}
+	if cacheDir == "" {
+		cacheDir = defaultCacheDir()
+	}
+	if total, free, ok := diskUsageNearest(cacheDir); ok {
+		storage = map[string]interface{}{
+			"path":        cacheDir,
+			"total_bytes": total,
+			"free_bytes":  free,
+		}
+	}
+
 	writeJSON(w, map[string]interface{}{
+		"platform": platformName,
 		"fuse": map[string]interface{}{
 			"available": fuseOK,
 			"hint":      fuseHint,
@@ -259,6 +319,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"data_dir":       s.store.dataDir,
 		"rclone_bin":     s.store.rcloneBin,
 		"disk":           disk,
+		"storage":        storage,
 		"mounts":         mounts,
 	})
 }

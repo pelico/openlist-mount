@@ -62,8 +62,8 @@
           <label>缓存扫描周期 <span class="hint-inline">1m 频繁扫</span>
             <input name="vfs_cache_poll_interval" value="1m">
           </label>
-          <label>缓存目录 <span class="hint-inline">tmpfs 内存中转,磁盘零写入</span>
-            <input name="cache_dir" value="/tmp/rclone-cache">
+          <label>缓存目录 <span class="hint-inline" id="cache-dir-hint">本地磁盘目录,非内存</span>
+            <input name="cache_dir" id="cache-dir-input" placeholder="/var/cache/openlist-mount">
           </label>
         </div>
       </details>
@@ -83,7 +83,7 @@
           </label>
           <p class="hint-inline" style="grid-column: 1 / -1;">
             🧮 内存极限 ≈ transfers(1) × buffer(8M) + FUSE(30M) = <b>38MB</b> <br>
-            🗄 缓存走 tmpfs,磁盘零写入,磁盘水位 < 10% 自动停 rclone
+            🗄 writes/full 模式会先把整个文件落到「缓存目录」所在的盘再上传,该盘剩余 &lt; 10% 会自动停 rclone 并清理缓存
           </p>
         </div>
       </details>
@@ -110,10 +110,18 @@
 
   <section class="card">
     <div class="row-between">
-      <h2>systemd 开机自启</h2>
+      <h2>存储</h2>
+      <button id="btn-storage" class="ghost">刷新占用</button>
+    </div>
+    <div id="storage"></div>
+  </section>
+
+  <section class="card">
+    <div class="row-between">
+      <h2 id="service-title">systemd 开机自启</h2>
       <button id="btn-systemd" class="ghost">生成 unit 文件</button>
     </div>
-    <p class="hint">生成的服务文件含 <code>Restart=on-failure</code> + <code>CAP_SYS_ADMIN</code> capability,挂载点需要 <code>/etc/fuse.conf</code> 启用 <code>user_allow_other</code>。</p>
+    <p class="hint" id="service-hint">生成的服务文件含 <code>Restart=on-failure</code> + <code>CAP_SYS_ADMIN</code> capability,挂载点需要 <code>/etc/fuse.conf</code> 启用 <code>user_allow_other</code>。</p>
   </section>
 </main>
 

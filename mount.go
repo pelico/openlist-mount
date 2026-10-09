@@ -4,13 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -29,8 +29,8 @@ type MountConfig struct {
 	AutoStart   bool   `json:"auto_start"`       // 工具启动时是否自动挂载
 
 	// ---- 新增:缓存精细化控制 ----
-	// CacheDir rclone 本地缓存目录(不填则用 rclone 默认位置)。
-	// 小设备建议指向 tmpfs,如 /tmp/rclone-cache。
+	// CacheDir rclone 本地缓存目录(不填则用平台默认,Linux 为 /var/cache/openlist-mount)。
+	// 注意:这是磁盘目录,writes/full 模式下文件会先整份落这里再上传,要留足空间。
 	CacheDir string `json:"cache_dir"`
 	// VfsCacheMaxSize 单个挂载本地缓存上限,如 "10G"、"500M"。空表示不限制(不推荐)。
 	VfsCacheMaxSize string `json:"vfs_cache_max_size"`
@@ -57,6 +57,11 @@ type MountStatus struct {
 	LastError string    `json:"last_error,omitempty"`
 	// 新增:最近一次探测的 FUSE 健康度("ok" 或 "stale")
 	FuseState string `json:"fuse_state,omitempty"`
+	// 新增:启动时发现的隐患(如挂载点被本地文件占用),供控制台提示
+	Warning string `json:"warning,omitempty"`
+	// 新增:日志里最近统计到的上传失败条数与最近一次失败原因
+	UploadFailures int    `json:"upload_failures,omitempty"`
+	UploadError    string `json:"upload_error,omitempty"`
 }
 
 // Store 负责配置持久化 + rclone 进程生命周期。
@@ -76,6 +81,9 @@ type runningProc struct {
 	lastError    string
 	stopCh       chan struct{}
 	monitorDone  chan struct{} // 用于等待监控 goroutine 退出
+	warn         string        // 启动时发现的隐患
+	uploadFails  int           // 最近统计到的上传失败条数
+	uploadErr    string        // 最近一次上传失败原因
 }
 
 func NewStore(dataDir, rcloneBin string) (*Store, error) {
@@ -185,11 +193,12 @@ func (s *Store) Upsert(c *MountConfig) error {
 	}
 
 	// ---- 极限资源默认值 ----
-	// 缓存目录:tmpfs 内存中转,磁盘零写入(玩客云磁盘不够)
+	// 缓存目录:Linux 默认 /var/cache/openlist-mount(磁盘目录,非内存);
+	// Windows 默认落在 %LOCALAPPDATA%,由 --vfs-cache-max-size 控上限。
 	if c.CacheDir == "" {
-		c.CacheDir = "/tmp/rclone-cache"
+		c.CacheDir = defaultCacheDir()
 	}
-	// 缓存上限:tmpfs 吃内存,500M 是玩客云能承受的上限(1G RAM 里挤)
+	// 缓存上限:小设备给 500M,配合下面的缓存清理兜底,避免把盘写满
 	if c.VfsCacheMaxSize == "" {
 		c.VfsCacheMaxSize = "500M"
 	}
@@ -229,10 +238,15 @@ func (s *Store) Upsert(c *MountConfig) error {
 
 // Delete 删除配置(若正在运行,先停止)。
 func (s *Store) Delete(id string) error {
-	if _, ok := s.Get(id); !ok {
+	cfg, ok := s.Get(id)
+	if !ok {
 		return errors.New("not found")
 	}
 	_ = s.Stop(id) // 忽略未运行的错误
+	// 配置已删除 → 该挂载的本地缓存必然是孤儿,直接清干净,避免长期占用磁盘
+	if cfg.CacheDir != "" {
+		purgeMountCache(cfg.CacheDir, "openlist_"+id)
+	}
 	// 先从内存中删除,再 regen rclone.conf
 	s.mu.Lock()
 	delete(s.configs, id)
@@ -253,66 +267,13 @@ func (s *Store) Status(id string) MountStatus {
 		st.PID = p.cmd.Process.Pid
 		st.StartedAt = p.startedAt
 		st.LastError = p.lastError
+		st.Warning = p.warn
+		st.UploadFailures = p.uploadFails
+		st.UploadError = p.uploadErr
 		// 探测 FUSE 挂载点是否健康
 		st.FuseState = probeFuseHealth(p.cmd.Process.Pid)
 	}
 	return st
-}
-
-// probeFuseHealth 快速探测 rclone FUSE 挂载点是否"真的活着"。
-// 返回 "ok" / "stale" / "unknown"。
-func probeFuseHealth(pid int) string {
-	if pid <= 0 {
-		return "unknown"
-	}
-	// 看 /proc/<pid>/cmdline 里有没有 rclone mount
-	cmd, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-	if err != nil || !strings.Contains(string(cmd), "rclone") {
-		return "stale"
-	}
-	// 另一种方式:进程是否在运行
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return "stale"
-	}
-	// 在 Unix 上 FindProcess 不会失败,只能通过发 signal=0 探测
-	if err := proc.Signal(syscall.Signal(0)); err != nil {
-		return "stale"
-	}
-	return "ok"
-}
-
-// cleanupStaleMount 尝试多种方法清理僵尸 FUSE 挂载。
-func cleanupStaleMount(mountpoint string) error {
-	if mountpoint == "" {
-		return nil
-	}
-	// 方法 1:正常 Unmount
-	if err := syscall.Unmount(mountpoint, 0); err == nil {
-		return nil
-	}
-	time.Sleep(300 * time.Millisecond)
-	// 方法 2:lazy + force
-	if err := syscall.Unmount(mountpoint, syscall.MNT_FORCE); err == nil {
-		return nil
-	}
-	time.Sleep(300 * time.Millisecond)
-	// 方法 3:fusermount -uF
-	if _, err := exec.LookPath("fusermount"); err == nil {
-		if err := exec.Command("fusermount", "-u", mountpoint).Run(); err == nil {
-			return nil
-		}
-		if err := exec.Command("fusermount", "-uF", mountpoint).Run(); err == nil {
-			return nil
-		}
-	}
-	// 方法 4:umount -l
-	if _, err := exec.LookPath("umount"); err == nil {
-		if err := exec.Command("umount", "-lf", mountpoint).Run(); err == nil {
-			return nil
-		}
-	}
-	return fmt.Errorf("failed to clean stale mount at %s", mountpoint)
 }
 
 // Start 启动 rclone mount 子进程。
@@ -331,13 +292,37 @@ func (s *Store) Start(id string) error {
 	}
 	s.mu.Unlock()
 
-	// 先 kill 掉这个挂载点残留的 rclone 进程 (僵尸挂载/上次 Stop 不彻底)
-	s.killRcloneForMountpoint(cfg.Mountpoint)
+	remoteName := "openlist_" + cfg.ID
 
-	// 准备挂载点
-	if err := os.MkdirAll(cfg.Mountpoint, 0o755); err != nil {
-		return fmt.Errorf("mkdir mountpoint: %w", err)
+	// 先 kill 掉这个 remote 残留的 rclone 进程 (僵尸挂载/上次 Stop 不彻底)
+	killRcloneForMountpoint(cfg.Mountpoint, remoteName)
+
+	// 准备挂载点(Linux 建目录;Windows 盘符则跳过)
+	if err := prepareMountpoint(cfg.Mountpoint); err != nil {
+		return fmt.Errorf("prepare mountpoint: %w", err)
 	}
+
+	// 隐患:挂载点当前不是挂载态、但里面已有本地文件。
+	// 说明上次挂载掉过,摄像头/Samba 可能正把数据直接写进本地磁盘,把那个盘塞满。
+	warnMsg := ""
+	if !isMounted(cfg.Mountpoint) {
+		if entries, err := os.ReadDir(cfg.Mountpoint); err == nil && len(entries) > 0 {
+			warnMsg = fmt.Sprintf("挂载点 %s 不是挂载态却有 %d 个本地文件:上次挂载可能掉线,数据被写进了本地磁盘", cfg.Mountpoint, len(entries))
+			fmt.Fprintf(os.Stderr, "[WARN] %s\n", warnMsg)
+		}
+	}
+
+	// 清理"别的挂载"残留下来的孤儿缓存(已删除/重建过的挂载)。
+	// 注意:只删非当前 remote 的,当前 remote 缓存里可能存着还没上传成功的文件。
+	if cfg.CacheDir != "" {
+		if freed, n := sweepOrphanCache(cfg.CacheDir, remoteName); n > 0 {
+			fmt.Fprintf(os.Stderr, "start %s: swept %d orphan cache dirs (%d bytes)\n", id, n, freed)
+		}
+	}
+
+	// 日志无限增长会把磁盘吃满,启动前先截断一次(运行期还有每分钟的轮转兜底)
+	logFile := filepath.Join(s.dataDir, cfg.ID+".log")
+	rotateLog(logFile, 16<<20)
 
 	// 多策略清理残留挂载(包括 FUSE 僵尸)
 	if isMounted(cfg.Mountpoint) {
@@ -357,7 +342,6 @@ func (s *Store) Start(id string) error {
 		return err
 	}
 
-	remoteName := "openlist_" + cfg.ID
 	vfsMode := cfg.VfsCacheMode
 	if vfsMode == "" {
 		vfsMode = "off"
@@ -373,11 +357,10 @@ func (s *Store) Start(id string) error {
 		"--transfers", fmt.Sprintf("%d", cfg.Transfers),
 		"--max-read-ahead", cfg.MaxReadAhead,
 		"--log-level", "INFO",
-		"--log-file", filepath.Join(s.dataDir, cfg.ID+".log"),
+		"--log-file", logFile,
 	}
-	if cfg.AllowOther {
-		args = append(args, "--allow-other")
-	}
+	// 平台特有参数(Linux: --allow-other;Windows: --volname)
+	args = append(args, platformMountArgs(cfg)...)
 
 	// 缓存目录(用户指定则用,否则 rclone 自己决定)
 	if cfg.CacheDir != "" {
@@ -416,6 +399,7 @@ func (s *Store) Start(id string) error {
 		startedAt:    time.Now(),
 		stopCh:       make(chan struct{}),
 		monitorDone:  make(chan struct{}),
+		warn:         warnMsg,
 	}
 
 	s.mu.Lock()
@@ -435,8 +419,11 @@ func (s *Store) Start(id string) error {
 		_ = os.Remove(pidFile)
 	}()
 
-	// 后台 2:磁盘水位保护(小设备防爆盘)
-	// 每 60 秒检查挂载点所在磁盘,剩余 < 5% 时给 rclone 发 SIGTERM
+	// 后台 2:日志轮转 + 磁盘水位保护(小设备防爆盘)
+	// - 日志:rclone 的 --log-file 会无限增长(实测 6 天涨到 2.5G),只有启动时截断压不住,
+	//   这里每分钟检查一次,超过 16MB 就截断。
+	// - 水位:真正被写满的是 VFS 缓存目录(writes 模式先落本地)和数据目录(日志/pid)所在的盘,
+	//   不是 FUSE 挂载点。任一剩余 < 10% 就停 rclone 并清缓存。
 	go func() {
 		defer close(proc.monitorDone)
 		ticker := time.NewTicker(60 * time.Second)
@@ -446,22 +433,52 @@ func (s *Store) Start(id string) error {
 			case <-proc.stopCh:
 				return
 			case <-ticker.C:
-				// 优先检查挂载点所在磁盘(Samba 实际写入的地方)
-				// 其次检查 data 目录(tmpfs cache-dir 不检查,tmpfs 剩余=内存剩余)
-				path := cfg.Mountpoint
-				if path == "" {
-					path = s.dataDir
+				// 1) 日志轮转,防止把根盘写满(rclone 的 --log-file 永不轮转)
+				rotateLog(logFile, 16<<20)
+
+				// 2) 统计上传失败。上传失败时 rclone 会无限重试(实测重试到 try #833),
+				//    文件永远留在缓存里、迟早把盘吃满,而用户以前完全看不到这件事。
+				if n, sample := scanUploadFailures(logFile); n > 0 {
+					s.mu.Lock()
+					if p, ok := s.procs[id]; ok {
+						p.uploadFails = n
+						p.uploadErr = sample
+					}
+					s.mu.Unlock()
+					fmt.Fprintf(os.Stderr, "[ALERT] mount %s: %d 条上传失败记录,最近一次: %s\n", id, n, sample)
 				}
-				pct, free := diskFreePct(path)
-				if free >= 0 && pct < 10 {
+
+				// 3) 逐个候选盘查水位。这里绝不删缓存里的任何文件 ——
+				//    没上传成功的文件可能是用户数据的唯一副本,删了就是真丢数据。
+				candidates := make([]string, 0, 2)
+				if cfg.CacheDir != "" {
+					candidates = append(candidates, cfg.CacheDir)
+				}
+				candidates = append(candidates, s.dataDir)
+				for _, path := range candidates {
+					pct, free := diskFreePct(path)
+					if free < 0 || pct >= 10 {
+						continue
+					}
+					pending := 0
+					if cfg.CacheDir != "" {
+						pending = countCacheFiles(cfg.CacheDir, remoteName)
+					}
 					fmt.Fprintf(os.Stderr,
-						"[ALERT] mount %s disk %.2f%% (free %d bytes) < 10%%, force-stopping rclone\n",
-						id, pct, free)
+						"[ALERT] mount %s disk %s %.2f%% (free %d bytes) < 10%%, stopping rclone\n",
+						id, path, pct, free)
+					s.mu.Lock()
+					if p, ok := s.procs[id]; ok {
+						p.lastError = fmt.Sprintf(
+							"磁盘 %s 仅剩 %.1f%%,已紧急停止挂载以免继续写满;缓存里还有 %d 个文件未上传(未删除)",
+							path, pct, pending)
+					}
+					s.mu.Unlock()
 					if proc.cmd.Process != nil {
-						_ = proc.cmd.Process.Signal(syscall.SIGTERM)
+						terminateProcess(proc.cmd.Process)
 						time.AfterFunc(5*time.Second, func() {
 							if proc.cmd.Process != nil && !proc.cmd.ProcessState.Exited() {
-								_ = proc.cmd.Process.Kill()
+								forceKillProcess(proc.cmd.Process)
 							}
 						})
 					}
@@ -484,25 +501,26 @@ func (s *Store) Stop(id string) error {
 		pidFile := filepath.Join(s.pidDir(), id+".pid")
 		if pid, _ := readPIDFile(pidFile); pid > 0 {
 			if p, err := os.FindProcess(pid); err == nil {
-				_ = p.Signal(syscall.SIGTERM)
+				terminateProcess(p)
 			}
 			_ = os.Remove(pidFile)
 		}
 		return errors.New("not running")
 	}
+	cfg, hasCfg := s.Get(id)
 	mountpoint := ""
-	if cfg, ok := s.Get(id); ok {
+	if hasCfg {
 		mountpoint = cfg.Mountpoint
 	}
 	if proc.cmd.Process != nil {
-		_ = proc.cmd.Process.Signal(syscall.SIGTERM)
+		terminateProcess(proc.cmd.Process)
 	}
 	// 通知监控 goroutine 退出(关闭 stopCh 触发 select 分支)
 	close(proc.stopCh)
 	// 用 timer 实现 5s 后强杀
 	timer := time.AfterFunc(5*time.Second, func() {
 		if proc.cmd.Process != nil {
-			_ = proc.cmd.Process.Kill()
+			forceKillProcess(proc.cmd.Process)
 		}
 	})
 	defer timer.Stop()
@@ -520,43 +538,27 @@ func (s *Store) Stop(id string) error {
 	if mountpoint != "" {
 		_ = cleanupStaleMount(mountpoint)
 	}
+	// 清理"别的挂载"残留下来的孤儿缓存;本挂载的缓存不碰(可能有没传上去的文件)
+	if hasCfg && cfg.CacheDir != "" {
+		if freed, n := sweepOrphanCache(cfg.CacheDir, "openlist_"+id); n > 0 {
+			fmt.Fprintf(os.Stderr, "stop %s: swept %d orphan cache dirs (%d bytes)\n", id, n, freed)
+		}
+	}
 	return nil
 }
 
-// killRcloneForMountpoint 用 pgrep+kill 干掉所有命令行里带这个挂载点的 rclone 进程。
-// 用于 Start() 前清残留, 避免 FUSE 僵尸或重复挂载。
-func (s *Store) killRcloneForMountpoint(mountpoint string) {
-	if mountpoint == "" {
-		return
+// StartAll 启动所有配置的挂载(供托盘菜单「全部启动」调用)。
+func (s *Store) StartAll() {
+	s.mu.RLock()
+	ids := make([]string, 0, len(s.configs))
+	for id := range s.configs {
+		ids = append(ids, id)
 	}
-	// pgrep -f "rclone mount <mountpoint>" → 拿到 PID
-	out, err := exec.Command("pgrep", "-f", "rclone mount .* "+mountpoint).Output()
-	if err != nil || len(out) == 0 {
-		return // 没残留
-	}
-	pids := strings.Fields(string(out))
-	for _, pidStr := range pids {
-		if pid, err := strconv.Atoi(pidStr); err == nil && pid > 1 {
-			proc, err := os.FindProcess(pid)
-			if err == nil {
-				_ = proc.Signal(syscall.SIGTERM)
-			}
+	s.mu.RUnlock()
+	for _, id := range ids {
+		if err := s.Start(id); err != nil {
+			fmt.Fprintf(os.Stderr, "start %s: %v\n", id, err)
 		}
-	}
-	// 等 1s, 还活着就强杀
-	time.Sleep(1 * time.Second)
-	out2, _ := exec.Command("pgrep", "-f", "rclone mount .* "+mountpoint).Output()
-	if len(out2) > 0 {
-		pids2 := strings.Fields(string(out2))
-		for _, pidStr := range pids2 {
-			if pid, err := strconv.Atoi(pidStr); err == nil && pid > 1 {
-				proc, err := os.FindProcess(pid)
-				if err == nil {
-					_ = proc.Kill()
-				}
-			}
-		}
-		time.Sleep(500 * time.Millisecond)
 	}
 }
 
@@ -622,17 +624,6 @@ func (s *Store) obscure(plain string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-func isMounted(path string) bool {
-	var st1, st2 syscall.Stat_t
-	if err := syscall.Stat(path, &st1); err != nil {
-		return false
-	}
-	if err := syscall.Stat(filepath.Dir(path), &st2); err != nil {
-		return false
-	}
-	return st1.Dev != st2.Dev
-}
-
 func readPIDFile(p string) (int, error) {
 	b, err := os.ReadFile(p)
 	if err != nil {
@@ -645,20 +636,192 @@ func readPIDFile(p string) (int, error) {
 	return pid, nil
 }
 
-// diskFreePct 返回 path 所在磁盘的剩余百分比 (0-100) 和剩余字节数。
-// 出错时返回 (-1, -1)。
-func diskFreePct(path string) (float64, int64) {
+// ---- 本地缓存清理 ----
+//
+// writes/full 模式下 rclone 会把文件先整份落到 --cache-dir,传完再靠
+// --vfs-cache-max-age 删掉。一旦进程被强杀、或写入速度长期高于上传速度,
+// 缓存就会残留、堆积,最后把这张小盘塞满。下面几个函数是兜底清理。
+
+// mountCachePaths 返回某挂载在 rclone 缓存目录下的数据/元数据路径。
+// rclone 布局: <cache-dir>/vfs/<remote>/ 与 <cache-dir>/vfsMeta/<remote>/
+func mountCachePaths(cacheDir, remoteName string) []string {
+	if cacheDir == "" || remoteName == "" {
+		return nil
+	}
+	return []string{
+		filepath.Join(cacheDir, "vfs", remoteName),
+		filepath.Join(cacheDir, "vfsMeta", remoteName),
+	}
+}
+
+// purgeMountCache 彻底删除某挂载的本地缓存(用于删除配置 / 手动一键清空)。
+// 会丢弃未上传成功的文件,只能由用户显式触发。
+func purgeMountCache(cacheDir, remoteName string) {
+	for _, p := range mountCachePaths(cacheDir, remoteName) {
+		_ = os.RemoveAll(p)
+	}
+}
+
+// sweepOrphanCache 删除缓存目录里属于"别的挂载"的残留(挂载被删除或重建后留下的),
+// 返回释放字节数与删除的顶层目录数。
+//
+// 只看 cacheDir 下 vfs/ 和 vfsMeta/ 的顶层目录,且只删名字以 openlist_ 开头、
+// 但不是当前 remote 的那些。当前 remote 的缓存一律不碰 —— 里面可能有
+// "还没上传成功"的文件,那是用户数据的唯一副本(曾被按修改时间当垃圾删过)。
+func sweepOrphanCache(cacheDir, currentRemote string) (int64, int) {
+	if cacheDir == "" {
+		return 0, 0
+	}
+	var freed int64
+	var n int
+	for _, root := range mountCacheRoots(cacheDir) {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if !e.IsDir() || name == currentRemote || !strings.HasPrefix(name, "openlist_") {
+				continue
+			}
+			p := filepath.Join(root, name)
+			freed += dirSize(p)
+			if err := os.RemoveAll(p); err == nil {
+				n++
+			}
+		}
+	}
+	return freed, n
+}
+
+// mountCacheRoots 返回缓存目录下 rclone 存放数据的两个顶层目录。
+func mountCacheRoots(cacheDir string) []string {
+	return []string{filepath.Join(cacheDir, "vfs"), filepath.Join(cacheDir, "vfsMeta")}
+}
+
+// countCacheFiles 统计某挂载缓存目录下的文件数,用于提示还有多少文件卡在缓存里。
+func countCacheFiles(cacheDir, remoteName string) int {
+	n := 0
+	for _, root := range mountCachePaths(cacheDir, remoteName) {
+		_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			n++
+			return nil
+		})
+	}
+	return n
+}
+
+// scanUploadFailures 读 rclone 日志尾部,统计"上传失败"的条数并取出最近一次失败原因。
+//
+// 上传失败时 rclone 会无限重试(实测重试到 try #833),文件一直卡在缓存里直到把盘吃满,
+// 但控制台以前什么都不显示 —— 摄像头录像实际上没存上去都不知道。
+func scanUploadFailures(logFile string) (int, string) {
+	const tailBytes = 128 << 10
+	f, err := os.Open(logFile)
+	if err != nil {
+		return 0, ""
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, ""
+	}
+	if off := fi.Size() - tailBytes; off > 0 {
+		if _, err := f.Seek(off, io.SeekStart); err != nil {
+			return 0, ""
+		}
+	}
+	buf, err := io.ReadAll(f)
+	if err != nil {
+		return 0, ""
+	}
+
+	var count int
+	var sample string
+	for _, line := range strings.Split(string(buf), "\n") {
+		if !strings.Contains(line, "failed to upload") && !strings.Contains(line, "Failed to copy") {
+			continue
+		}
+		count++
+		if i := strings.Index(line, "Failed to copy: "); i >= 0 {
+			sample = strings.TrimSpace(line[i+len("Failed to copy: "):])
+		}
+	}
+	return count, sample
+}
+
+// dirSize 递归统计目录占用字节数;目录不存在返回 0。
+func dirSize(path string) int64 {
+	var total int64
+	_ = filepath.WalkDir(path, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if info, e := d.Info(); e == nil {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+// diskUsageNearest 返回 path 所在分区的容量。path 还不存在时(如尚未挂载过、
+// 缓存目录没建)向上找最近的已存在父目录,保证控制台能提前显示那张盘的容量。
+func diskUsageNearest(path string) (uint64, uint64, bool) {
 	if path == "" {
-		return -1, -1
+		return 0, 0, false
 	}
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(path, &stat); err != nil {
-		return -1, -1
+	p := path
+	for i := 0; i < 32 && p != ""; i++ {
+		if total, free, ok := diskUsage(p); ok {
+			return total, free, true
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			break
+		}
+		p = parent
 	}
-	total := stat.Blocks * uint64(stat.Bsize)
-	free := stat.Bavail * uint64(stat.Bsize)
-	if total == 0 {
-		return -1, -1
+	return 0, 0, false
+}
+
+// rotateLog 日志超过 maxBytes 时清空重来,避免长期运行把磁盘吃满。
+func rotateLog(path string, maxBytes int64) {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() <= maxBytes {
+		return
 	}
-	return float64(free) / float64(total) * 100.0, int64(free)
+	_ = os.Truncate(path, 0)
+}
+
+// CacheSize 返回某挂载当前占用的本地缓存字节数。
+func (s *Store) CacheSize(id string) int64 {
+	cfg, ok := s.Get(id)
+	if !ok || cfg.CacheDir == "" {
+		return 0
+	}
+	var total int64
+	for _, p := range mountCachePaths(cfg.CacheDir, "openlist_"+id) {
+		total += dirSize(p)
+	}
+	return total
+}
+
+// CleanCache 清空某挂载的本地缓存并返回释放的字节数。
+// 供"缓存盘爆满/停止后残留"时手动清空;若挂载仍在运行请先停止。
+func (s *Store) CleanCache(id string) (int64, error) {
+	cfg, ok := s.Get(id)
+	if !ok {
+		return 0, errors.New("not found")
+	}
+	if cfg.CacheDir == "" {
+		return 0, nil
+	}
+	freed := s.CacheSize(id)
+	purgeMountCache(cfg.CacheDir, "openlist_"+id)
+	return freed, nil
 }

@@ -85,8 +85,60 @@ jobs:
             ${{ env.BIN_VER }}.tar.gz
             ${{ env.BIN_VER }}.gz
 
+  build-windows:
+    name: Build windows-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # install.ps1 默认按 x64 拉取 openlist-mount.exe;ARM64 走 openlist-mount-a64.exe
+          - { arch: amd64, out: openlist-mount.exe }
+          - { arch: arm64, out: openlist-mount-a64.exe }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Build GUI tray exe
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: '0'
+        run: |
+          VERSION=${GITHUB_REF_NAME:-${{ github.event.inputs.tag_name }}}
+          [ -z "$VERSION" ] && VERSION="dev-${GITHUB_SHA::7}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+          # -H windowsgui: 双击不弹黑框,纯托盘运行
+          go build -trimpath \
+            -ldflags="-s -w -H windowsgui -X main.version=${VERSION}" \
+            -o "${{ matrix.out }}" .
+
+          ls -lh "${{ matrix.out }}"
+
+      # Windows 整包:exe + 安装脚本,解压后管理员运行 install.ps1 即可
+      - name: Package zip (amd64 only)
+        if: matrix.arch == 'amd64'
+        run: |
+          mkdir -p pkg
+          cp openlist-mount.exe install.ps1 pkg/
+          (cd pkg && zip -r ../openlist-mount_windows-amd64.zip .)
+          ls -lh openlist-mount_windows-amd64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: |
+            ${{ matrix.out }}
+            openlist-mount_windows-amd64.zip
+          if-no-files-found: ignore
+
   release:
-    needs: build
+    needs: [build, build-windows]
     runs-on: ubuntu-latest
     steps:
       # merge-multiple: true → 所有架构的 artifact 内容扁平合并到 dist/ 下
@@ -133,3 +185,6 @@ jobs:
             dist/openlist-mount-*
             dist/openlist-mount_*.tar.gz
             dist/openlist-mount_*.gz
+            dist/openlist-mount.exe
+            dist/openlist-mount-a64.exe
+            dist/openlist-mount_windows-amd64.zip

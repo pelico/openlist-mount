@@ -28,6 +28,53 @@ function fmtBytes(b) {
   return v.toFixed(1) + units[i];
 }
 
+// ---- 平台相关默认值(运行时从 /api/health 获取) ----
+let PLATFORM = 'linux';
+let platformApplied = false;
+
+const PLATFORM_DEFAULTS = {
+  linux:   { mountpoint: '/mnt/openlist', cacheDir: '/var/cache/openlist-mount' },
+  windows: { mountpoint: 'X:',            cacheDir: '' },
+};
+
+function applyPlatform(p) {
+  PLATFORM = (p === 'windows') ? 'windows' : 'linux';
+  const d = PLATFORM_DEFAULTS[PLATFORM];
+
+  const mp = document.querySelector('input[name=mountpoint]');
+  if (mp) mp.placeholder = d.mountpoint;
+
+  const cd = document.getElementById('cache-dir-input');
+  const cdHint = document.getElementById('cache-dir-hint');
+  if (cd) {
+    cd.placeholder = d.cacheDir || '留空则用系统默认';
+    cd.value = d.cacheDir;
+  }
+
+  const ao = document.querySelector('input[name=allow_other]');
+  if (ao) {
+    const lab = ao.closest('label');
+    if (PLATFORM === 'windows') {
+      ao.checked = false;
+      if (lab) lab.style.display = 'none';
+    } else if (lab) {
+      lab.style.display = '';
+    }
+  }
+
+  const st = document.getElementById('service-title');
+  const sh = document.getElementById('service-hint');
+  const sb = document.getElementById('btn-systemd');
+  if (PLATFORM === 'windows') {
+    if (cdHint) cdHint.textContent = '本地磁盘缓存,默认 %LOCALAPPDATA%';
+    if (st) st.textContent = 'Windows 开机自启';
+    if (sh) sh.innerHTML = '生成 PowerShell 片段:注册计划任务,登录后自动启动托盘程序。也可直接运行安装包内的 <code>install.ps1</code>。';
+    if (sb) sb.textContent = '生成自启脚本';
+  } else {
+    if (cdHint) cdHint.textContent = '本地磁盘目录,非内存;占满会自动停挂载';
+  }
+}
+
 async function checkRclone() {
   const el = document.getElementById('rclone-status');
   try {
@@ -49,11 +96,20 @@ async function checkHealth() {
   const el = document.getElementById('health-hint');
   try {
     const h = await req('/api/health');
+    if (!platformApplied && h.platform) {
+      applyPlatform(h.platform);
+      platformApplied = true;
+    }
     const msgs = [];
     if (h.fuse && !h.fuse.available) msgs.push('❌ ' + h.fuse.hint);
     if (h.fuse_conf_hint) msgs.push('⚠ ' + h.fuse_conf_hint);
     if (h.disk && h.disk.free_bytes !== undefined) {
       msgs.push('💾 数据目录剩余 ' + fmtBytes(h.disk.free_bytes) + ' / ' + fmtBytes(h.disk.total_bytes));
+    }
+    if (h.storage && h.storage.free_bytes !== undefined) {
+      const pct = h.storage.total_bytes ? (h.storage.free_bytes / h.storage.total_bytes * 100) : 100;
+      const tag = pct < 10 ? '❌' : '🗄';
+      msgs.push(tag + ' 缓存盘剩余 ' + fmtBytes(h.storage.free_bytes) + ' / ' + fmtBytes(h.storage.total_bytes) + ' (' + pct.toFixed(0) + '%)');
     }
     if (msgs.length) {
       el.innerHTML = msgs.join(' · ');
@@ -111,7 +167,9 @@ function renderItem(it) {
       <div>
         <span class="item-name">${escapeHtml(c.name)}</span>
         <span class="badge ${cls}">${label}</span>
-        ${fuse === 'stale' ? '<span class="badge err">FUSE僵尸</span>' : ''}
+        ${fuse === 'stale' ? `<span class="badge err">${PLATFORM === 'windows' ? '挂载异常' : 'FUSE僵尸'}</span>` : ''}
+        ${s.warning ? '<span class="badge stop">挂载点异常</span>' : ''}
+        ${s.upload_failures ? `<span class="badge err">上传失败 ${s.upload_failures}</span>` : ''}
       </div>
       <div class="item-actions">
         ${toggleBtn}
@@ -124,6 +182,8 @@ function renderItem(it) {
       挂载点: ${escapeHtml(c.mountpoint)}
       ${s.running ? ` · PID ${s.pid} · 启动 ${fmtTime(s.started_at)}` : ''}
       ${s.last_error ? ` · <span class="err-text">错误: ${escapeHtml(s.last_error)}</span>` : ''}
+      ${s.warning ? `<br><span class="warn-text">⚠ ${escapeHtml(s.warning)}</span>` : ''}
+      ${s.upload_error ? `<br><span class="err-text">⚠ 上传持续失败:${escapeHtml(s.upload_error)} —— 文件会一直卡在缓存里传不上去(重试不会停止),请检查目标存储是否可写</span>` : ''}
       <br>目录缓存 ${escapeHtml(c.dir_cache || '24h')} · 属性缓存 ${escapeHtml(c.attr_time || '1h')}
       <br>${cacheParts.join(' · ')}
       <br>🧠 ${memParts.join(' · ')}
@@ -196,11 +256,11 @@ document.getElementById('add-form').addEventListener('submit', async (e) => {
     form.vfs_cache_max_size.value = '500M';
     form.vfs_cache_max_age.value = '5m';
     form.vfs_cache_poll_interval.value = '1m';
-    form.cache_dir.value = '/tmp/rclone-cache';
+    form.cache_dir.value = PLATFORM_DEFAULTS[PLATFORM].cacheDir;
     form.transfers.value = 1;
     form.buffer_size.value = '8M';
     form.max_read_ahead.value = '0';
-    form.allow_other.checked = true;
+    form.allow_other.checked = PLATFORM !== 'windows';
     await loadList();
   } catch (err) {
     alert(err.message);
@@ -209,11 +269,90 @@ document.getElementById('add-form').addEventListener('submit', async (e) => {
 
 // 刷新 + systemd
 document.getElementById('btn-refresh').onclick = loadList;
+document.getElementById('btn-storage').onclick = loadStorage;
 document.getElementById('btn-systemd').onclick = async () => {
   const r = await fetch('/api/systemd', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
   const text = await r.text();
-  openModal('openlist-mount.service', text + '\n\n# 安装:\n# sudo cp openlist-mount.service /etc/systemd/system/\n# sudo systemctl daemon-reload\n# sudo systemctl enable --now openlist-mount');
+  let title, footer;
+  if (PLATFORM === 'windows') {
+    title = 'Windows 开机自启';
+    footer = '\n\n# 用法:以管理员身份打开 PowerShell,粘贴执行上述命令即可。';
+  } else {
+    title = 'openlist-mount.service';
+    footer = '\n\n# 安装:\n# sudo cp openlist-mount.service /etc/systemd/system/\n# sudo systemctl daemon-reload\n# sudo systemctl enable --now openlist-mount';
+  }
+  openModal(title, text + footer);
 };
+
+// ---- 存储用量 ----
+async function loadStorage() {
+  const el = document.getElementById('storage');
+  if (!el) return;
+  try {
+    const d = await req('/api/storage');
+    const rows = [];
+
+    // 数据目录(配置 / 日志 / pid)
+    if (d.data_total_bytes !== undefined && d.data_free_bytes !== undefined) {
+      rows.push(storageRow('数据目录', d.data_dir, d.data_free_bytes, d.data_total_bytes, null));
+    } else {
+      rows.push(`<div class="storage-row"><span class="storage-name">数据目录</span>` +
+        `<span class="storage-num">${escapeHtml(d.data_dir || '-')}</span></div>`);
+    }
+
+    // 各挂载的缓存目录所在磁盘 + 当前缓存占用
+    (d.mounts || []).forEach(m => {
+      rows.push(storageRow('缓存 · ' + (m.name || m.id), m.cache_dir || '(未设置)',
+        m.free_bytes, m.total_bytes, { id: m.id, cacheBytes: m.cache_bytes }));
+    });
+    if (!d.mounts || !d.mounts.length) {
+      rows.push('<p class="storage-empty">还没有挂载项。</p>');
+    }
+
+    el.innerHTML = rows.join('');
+    bindCleanButtons();
+  } catch (e) {
+    el.innerHTML = '<p class="storage-empty">读取失败: ' + escapeHtml(e.message) + '</p>';
+  }
+}
+
+function storageRow(label, path, freeBytes, totalBytes, cache) {
+  let num = '容量未知';
+  let pct = 100;
+  if (totalBytes !== undefined && freeBytes !== undefined && totalBytes > 0) {
+    pct = freeBytes / totalBytes * 100;
+    num = '可用 ' + fmtBytes(freeBytes) + ' / 总 ' + fmtBytes(totalBytes) + ' (' + pct.toFixed(0) + '%)';
+  }
+  const low = pct < 10;
+  const cachePart = cache
+    ? `<span class="storage-num">缓存占用 ${fmtBytes(cache.cacheBytes)}</span>` +
+      `<button data-clean="${cache.id}" class="danger">清空缓存</button>`
+    : '';
+  return `<div class="storage-row${low ? ' low' : ''}">
+    <span class="storage-name">${escapeHtml(label)}</span>
+    <span class="storage-num">${escapeHtml(path || '-')}</span>
+    <span class="storage-num">${num}</span>
+    <span class="storage-bar"><i style="width:${pct.toFixed(0)}%"></i></span>
+    ${low ? '<span class="storage-warn">剩余不足 10%,挂载会被自动停止!</span>' : ''}
+    ${cachePart}
+  </div>`;
+}
+
+function bindCleanButtons() {
+  document.querySelectorAll('#storage button[data-clean]').forEach(btn => {
+    btn.onclick = async () => {
+      const id = btn.dataset.clean;
+      if (!confirm('确认清空该挂载的本地缓存?\n正在上传中的文件会丢失,建议先停止挂载。')) return;
+      try {
+        const r = await req(`/api/mounts/${id}/cache/clean`, {method: 'POST'});
+        alert('已清理,释放 ' + fmtBytes(r.freed_bytes || 0));
+        loadStorage();
+      } catch (e) {
+        alert(e.message);
+      }
+    };
+  });
+}
 
 // 模态框
 function openModal(title, body) {
@@ -227,5 +366,6 @@ document.getElementById('modal-close').onclick = () => document.getElementById('
 checkRclone();
 checkHealth();
 loadList();
-// 每 15s 刷新列表 + 健康状态
-setInterval(() => { loadList(); checkHealth(); }, 15000);
+loadStorage();
+// 每 15s 刷新列表 + 健康状态 + 存储用量
+setInterval(() => { loadList(); checkHealth(); loadStorage(); }, 15000);

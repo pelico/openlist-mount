@@ -115,3 +115,20 @@ button.danger:hover { background: #fff1f0; }
   font-size: 11px; color: #86909c; font-weight: normal;
 }
 .err-text { color: #d4380d; }
+.warn-text { color: #d46b08; }
+
+/* 存储卡片 */
+.storage-row {
+  display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center;
+  padding: 8px 0; border-bottom: 1px solid #f2f3f5; font-size: 13px;
+}
+.storage-row:last-child { border-bottom: none; }
+.storage-row .storage-name { font-weight: 500; color: #1d2129; min-width: 120px; }
+.storage-row .storage-num { color: #4e5969; }
+.storage-row .storage-bar {
+  flex: 1; min-width: 120px; height: 6px; border-radius: 3px; background: #f2f3f5; overflow: hidden;
+}
+.storage-row .storage-bar > i { display: block; height: 100%; background: #08979c; }
+.storage-row.low .storage-bar > i { background: #d4380d; }
+.storage-row .storage-warn { color: #d4380d; font-size: 12px; }
+.storage-empty { font-size: 13px; color: #86909c; }
